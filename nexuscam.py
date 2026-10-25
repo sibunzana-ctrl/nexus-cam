@@ -437,6 +437,397 @@ class _ShareEnded(Exception):
     """The desktop (or user, via the system indicator) ended the share."""
 
 
+# ----------------------------------------------------------------- phone camera
+# Your phone becomes a camera over Wi-Fi: NexusCam serves a small page over
+# HTTPS (browsers only allow the camera on secure pages), the phone opens it by
+# scanning a QR code, and streams JPEG frames back. No app to install.
+import secrets
+import socket
+import ssl
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PHONE_ID = "phone:wifi"
+PHONE_LABEL = "Phone camera (Wi-Fi)"
+PHONE_PORT = 8765
+PHONE_CERT = os.path.join(APP_DIR, "phone_cert.pem")
+PHONE_KEY = os.path.join(APP_DIR, "phone_key.pem")
+PHONE_TOKEN_FILE = os.path.join(APP_DIR, "phone_token")
+
+
+def lan_ip():
+    """The address other devices on your Wi-Fi reach this PC at (no traffic is sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+def ensure_phone_cert():
+    """A self-signed certificate so the phone's browser will allow the camera."""
+    if os.path.exists(PHONE_CERT) and os.path.exists(PHONE_KEY):
+        return True
+    if not shutil.which("openssl"):
+        return False
+    os.makedirs(APP_DIR, exist_ok=True)
+    r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", PHONE_KEY, "-out", PHONE_CERT, "-days", "3650",
+                        "-subj", "/CN=NexusCam"], capture_output=True, timeout=60)
+    if r.returncode == 0:
+        os.chmod(PHONE_KEY, 0o600)
+    return r.returncode == 0
+
+
+def phone_token():
+    """A secret in the link, so nobody else on the network can send frames."""
+    try:
+        with open(PHONE_TOKEN_FILE) as f:
+            t = f.read().strip()
+            if len(t) >= 8:
+                return t
+    except OSError:
+        pass
+    t = secrets.token_urlsafe(9)
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(PHONE_TOKEN_FILE, "w") as f:
+        f.write(t)
+    return t
+
+
+class PhoneServer:
+    def __init__(self):
+        self.token = phone_token()
+        self.port = None
+        self.httpd = None
+        self.error = None
+        self.latest = None
+        self.seq = 0
+        self.last_time = 0.0
+        self.fps = 0.0
+        self.device = ""
+        self.size = (0, 0)
+        self._cond = threading.Condition()
+        self._fps_t, self._fps_n = time.time(), 0
+
+    @property
+    def running(self):
+        return self.httpd is not None
+
+    @property
+    def connected(self):
+        return time.time() - self.last_time < 2.5
+
+    @property
+    def url(self):
+        return f"https://{lan_ip()}:{self.port}/?k={self.token}" if self.port else ""
+
+    def start(self):
+        if self.httpd is not None:
+            return True
+        if not ensure_phone_cert():
+            self.error = ("Couldn't create the security certificate the phone needs.\n\n"
+                          "Install openssl:  sudo apt install openssl")
+            return False
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(PHONE_CERT, PHONE_KEY)
+        last_err = None
+        for port in range(PHONE_PORT, PHONE_PORT + 10):
+            try:
+                httpd = ThreadingHTTPServer(("0.0.0.0", port), _PhoneHandler)
+                break
+            except OSError as e:
+                last_err = e
+        else:
+            self.error = f"Couldn't open a network port for the phone:\n{last_err}"
+            return False
+        httpd.daemon_threads = True
+        # the phone's browser drops its first connection after the certificate
+        # warning — expected, so don't print those as errors
+        httpd.handle_error = lambda request, client_address: None
+        # handshake in each connection's own thread, never in the accept loop
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True,
+                                       do_handshake_on_connect=False)
+        httpd.phone = self
+        self.httpd, self.port = httpd, port
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return True
+
+    def stop(self):
+        if self.httpd is not None:
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                pass
+            self.httpd = None
+        with self._cond:
+            self._cond.notify_all()
+
+    def push(self, jpeg):
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return False
+        now = time.time()
+        with self._cond:
+            self.latest = frame
+            self.seq += 1
+            self.last_time = now
+            self.size = (frame.shape[1], frame.shape[0])
+            self._cond.notify_all()
+        self._fps_n += 1
+        if now - self._fps_t >= 1.0:
+            self.fps = self._fps_n / (now - self._fps_t)
+            self._fps_t, self._fps_n = now, 0
+        return True
+
+    def wait_frame(self, last_seq, timeout=1.0):
+        with self._cond:
+            self._cond.wait_for(lambda: self.seq != last_seq or self.httpd is None, timeout)
+            return self.seq, self.latest
+
+    def capture(self):
+        return _PhoneCapture(self)
+
+
+class _PhoneCapture:
+    """Looks like cv2.VideoCapture to the engine."""
+
+    def __init__(self, server):
+        self.server = server
+        self.seq = server.seq
+
+    def isOpened(self):
+        return self.server.running
+
+    def read(self, timeout=1.0):
+        seq, frame = self.server.wait_frame(self.seq, timeout)
+        if seq == self.seq or frame is None:
+            return False, None
+        self.seq = seq
+        return True, frame
+
+    def set(self, *a):
+        return True
+
+    def release(self):
+        pass
+
+
+class _PhoneHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive: one TLS handshake, many frames
+    server_version = "NexusCam"
+
+    def log_message(self, *a):
+        pass
+
+    def _authorised(self):
+        q = parse_qs(urlparse(self.path).query)
+        return secrets.compare_digest((q.get("k") or [""])[0], self.server.phone.token)
+
+    def _reply(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path != "/":
+            return self._reply(404, b"Not found")
+        if not self._authorised():
+            return self._reply(403, PHONE_DENIED.encode(), "text/html; charset=utf-8")
+        page = PHONE_PAGE.replace("%TOKEN%", self.server.phone.token)
+        self._reply(200, page.encode(), "text/html; charset=utf-8")
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if 0 < n <= 12_000_000 else b""
+        if not self._authorised():
+            return self._reply(403, b"Wrong link")
+        if path == "/frame":
+            ok = self.server.phone.push(body)
+            return self._reply(204 if ok else 400)
+        if path == "/hello":
+            try:
+                self.server.phone.device = json.loads(body or b"{}").get("device", "")[:60]
+            except ValueError:
+                pass
+            return self._reply(204)
+        self._reply(404, b"Not found")
+
+
+PHONE_DENIED = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<body style="background:#0a0e13;color:#e8eef5;font:16px system-ui;padding:32px">
+<h2>Link not valid</h2><p style="color:#94a3b3">Scan the QR code shown in NexusCam again.</p>"""
+
+PHONE_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0e13">
+<title>NexusCam · Phone camera</title>
+<style>
+:root{--bg:#0a0e13;--panel:#10151c;--field:#18202b;--line:#212b37;--text:#e8eef5;--muted:#94a3b3;
+--accent:#3b82f6;--live:#ef4444;--ok:#22c55e;--warn:#f59e0b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif}
+body{display:flex;flex-direction:column;padding:max(14px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom))}
+header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(#2563eb,#7c3aed);position:relative;flex:none}
+.logo:before{content:"";position:absolute;inset:7px;border:2.5px solid #fff;border-radius:50%}
+.logo:after{content:"";position:absolute;width:6px;height:6px;border-radius:50%;background:#ff4d4d;right:3px;top:3px}
+h1{font-size:16px;margin:0;font-weight:700}
+.sub{font-size:11px;letter-spacing:.06em;color:#5c6a7a;font-weight:700}
+.stage{position:relative;flex:1;min-height:200px;border-radius:16px;overflow:hidden;background:var(--panel);
+border:1px solid var(--line);display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain;background:#000;display:none}
+video.on{display:block}
+video.mirror{transform:scaleX(-1)}
+.empty{color:var(--muted);text-align:center;padding:24px}
+.empty b{display:block;color:var(--text);font-size:18px;margin-bottom:6px}
+.pill{position:absolute;left:12px;top:12px;display:flex;align-items:center;gap:7px;padding:6px 12px;border-radius:99px;
+background:rgba(10,14,19,.82);font-size:13px;font-weight:700}
+.dot{width:8px;height:8px;border-radius:50%;background:#5c6a7a}
+.pill.live .dot{background:var(--ok)} .pill.err .dot{background:var(--live)} .pill.wait .dot{background:var(--warn)}
+.turn{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:rgba(10,14,19,.85);
+padding:8px 14px;border-radius:99px;font-size:13px;color:var(--warn);font-weight:600;display:none;white-space:nowrap}
+.row{display:flex;gap:10px;margin-top:12px}
+button{appearance:none;border:0;border-radius:12px;font:inherit;font-weight:700;color:var(--text);
+background:var(--field);border:1px solid var(--line);height:52px;padding:0 16px;flex:1}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.stop{background:var(--live);border-color:var(--live);color:#fff}
+button:disabled{opacity:.45}
+.seg{display:flex;background:var(--field);border:1px solid var(--line);border-radius:12px;padding:3px;flex:1}
+.seg button{height:44px;border:0;background:transparent;color:var(--muted);border-radius:9px}
+.seg button.sel{background:var(--accent);color:#fff}
+.hint{color:var(--muted);font-size:13px;margin-top:12px;text-align:center}
+.msg{background:#3a1618;border:1px solid #5a2427;color:#fecaca;border-radius:12px;padding:12px 14px;margin-top:12px;display:none}
+</style></head>
+<body>
+<header><div class="logo"></div><div><h1>NexusCam</h1><div class="sub">PHONE CAMERA</div></div></header>
+<div class="stage">
+  <video id="v" playsinline muted autoplay></video>
+  <div class="empty" id="empty"><b>Ready</b>Tap Start to use this phone as your NexusCam camera.</div>
+  <div class="pill" id="pill"><span class="dot"></span><span id="ptxt">Not sending</span></div>
+  <div class="turn" id="turn">↻ Turn your phone sideways</div>
+</div>
+<div class="msg" id="msg"></div>
+<div class="row">
+  <div class="seg" id="facing"><button data-v="user" class="sel">Front</button><button data-v="environment">Back</button></div>
+  <div class="seg" id="quality"><button data-v="1280" class="sel">720p</button><button data-v="1920">1080p</button></div>
+</div>
+<div class="row"><button id="go" class="primary">Start</button></div>
+<div class="hint">Keep this page open while recording. The screen stays on.</div>
+<script>
+const K = "%TOKEN%";
+const v = document.getElementById("v"), go = document.getElementById("go");
+const pill = document.getElementById("pill"), ptxt = document.getElementById("ptxt");
+const msg = document.getElementById("msg"), turn = document.getElementById("turn"), empty = document.getElementById("empty");
+let facing = "user", quality = 1280, stream = null, running = false, inflight = 0, wake = null;
+let sent = 0, t0 = performance.now(), failing = 0;
+const c = document.createElement("canvas"), ctx = c.getContext("2d");
+
+function status(text, kind){ ptxt.textContent = text; pill.className = "pill " + (kind||""); }
+function error(text){ msg.textContent = text; msg.style.display = text ? "block" : "none"; }
+
+function seg(id, cb){
+  const el = document.getElementById(id);
+  el.addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    el.querySelectorAll("button").forEach(x => x.classList.toggle("sel", x === b));
+    cb(b.dataset.v);
+  });
+}
+seg("facing", async val => { facing = val; if (stream) await openCam(); });
+seg("quality", async val => { quality = +val; if (stream) await openCam(); });
+
+async function openCam(){
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({audio:false, video:{
+    facingMode: facing, width:{ideal: quality}, height:{ideal: Math.round(quality*9/16)}, frameRate:{ideal:30}}});
+  v.srcObject = stream; v.classList.add("on"); empty.style.display = "none";
+  v.classList.toggle("mirror", facing === "user");
+  await v.play();
+}
+
+async function keepAwake(){
+  try { if ("wakeLock" in navigator) wake = await navigator.wakeLock.request("screen"); } catch(e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && running) keepAwake();
+  if (document.visibilityState === "hidden" && running) status("Paused — reopen this page", "wait");
+});
+
+function send(blob){
+  inflight++;
+  fetch("/frame?k=" + K, {method:"POST", body: blob, headers:{"Content-Type":"image/jpeg"}, cache:"no-store"})
+    .then(r => {
+      if (r.status === 403) { stop(); error("This link is out of date. Scan the QR code in NexusCam again."); return; }
+      failing = 0; sent++;
+      const now = performance.now();
+      if (now - t0 > 1000) { status("Connected · " + Math.round(sent * 1000 / (now - t0)) + " fps", "live"); sent = 0; t0 = now; }
+    })
+    .catch(() => { if (++failing > 3) status("Can't reach NexusCam", "err"); })
+    .finally(() => { inflight--; });
+}
+
+function loop(){
+  if (!running) return;
+  const w = v.videoWidth, h = v.videoHeight;
+  turn.style.display = (w && h > w) ? "block" : "none";
+  if (w && inflight < 2 && document.visibilityState === "visible") {
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    ctx.drawImage(v, 0, 0, w, h);
+    c.toBlob(b => b && send(b), "image/jpeg", 0.82);
+  }
+  if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(loop); else setTimeout(loop, 33);
+}
+
+async function start(){
+  error("");
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    error("The camera is blocked on this page. Open the link from the QR code (it starts with https://) and accept the security warning.");
+    return;
+  }
+  go.disabled = true; status("Starting camera…", "wait");
+  try { await openCam(); }
+  catch (e) {
+    go.disabled = false; status("Not sending");
+    error(e.name === "NotAllowedError" ? "Camera permission was refused. Allow camera access for this page in your browser settings, then tap Start."
+                                       : "Couldn't open the camera: " + e.message);
+    return;
+  }
+  fetch("/hello?k=" + K, {method:"POST", body: JSON.stringify({device: navigator.userAgentData?.platform || (navigator.userAgent.match(/\(([^;)]+)/)||[])[1] || "Phone"})}).catch(()=>{});
+  running = true; t0 = performance.now(); sent = 0;
+  go.disabled = false; go.textContent = "Stop"; go.className = "stop";
+  status("Connecting…", "wait"); keepAwake(); loop();
+}
+
+function stop(){
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; v.classList.remove("on"); empty.style.display = "";
+  go.textContent = "Start"; go.className = "primary"; status("Not sending"); turn.style.display = "none";
+  if (wake) { wake.release().catch(()=>{}); wake = null; }
+}
+
+go.addEventListener("click", () => running ? stop() : start());
+</script>
+</body></html>
+"""
+
+PHONE = PhoneServer()
+
+
 # ----------------------------------------------------------------- camera grabber
 class FrameGrabber(threading.Thread):
     """Reads (and MJPG-decodes) camera frames on its own thread, so decoding
@@ -779,6 +1170,7 @@ class Engine(threading.Thread):
         self._settings = dict(settings)
         self.screen = screen
         self.recorder = None
+        self.waiting_phone = False
         self.running = False
         self.live = live
         self.vcam_open = False
@@ -811,31 +1203,55 @@ class Engine(threading.Thread):
         w, h = map(int, s["resolution"].split("x"))
         fps = int(s["fps"])
 
-        cap = cv2.VideoCapture(s["camera"], cv2.CAP_V4L2)
-        if not cap.isOpened():
-            self.error = (f"Could not open camera {s['camera']}.\n"
-                          "Close any other app using it and try again.")
-            self.running = False
-            return
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self._lock_framerate(s["camera"])
+        phone = s["camera"] == PHONE_ID
+        if phone:
+            # wait (as long as it takes) for the phone to start sending
+            if not PHONE.start():
+                self.error = PHONE.error
+                self.running = False
+                return
+            cap = PHONE.capture()
+            self.waiting_phone = True
+            ok = False
+            while self.running and not ok:
+                ok, frame = cap.read(0.5)
+            self.waiting_phone = False
+            if not ok:
+                self.running = False
+                return
+        else:
+            cap = cv2.VideoCapture(s["camera"], cv2.CAP_V4L2)
+            if not cap.isOpened():
+                self.error = (f"Could not open camera {s['camera']}.\n"
+                              "Close any other app using it and try again.")
+                self.running = False
+                return
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            cap.set(cv2.CAP_PROP_FPS, fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._lock_framerate(s["camera"])
 
-        ok, frame = cap.read()
-        if not ok:
-            self.error = f"Camera {s['camera']} opened but returned no frames."
-            cap.release()
-            self.running = False
-            return
+            ok, frame = cap.read()
+            if not ok:
+                self.error = f"Camera {s['camera']} opened but returned no frames."
+                cap.release()
+                self.running = False
+                return
 
         # output size: the camera's own, or a fixed size (e.g. 1080p output from a
         # 720p webcam — the screen/chart stays sharp, only you are upscaled)
         h, w = frame.shape[:2]
         out_size = None
-        if s.get("output_size", "Same as camera") != "Same as camera":
+        if phone:
+            # the phone can rotate or switch cameras mid-stream, so every frame is
+            # fitted to one fixed size (the virtual camera can't change size)
+            want = s.get("output_size", "Same as camera")
+            ow, oh = map(int, (s["resolution"] if want == "Same as camera" else want).split("x"))
+            out_size = (ow, oh)
+            w, h = ow, oh
+        elif s.get("output_size", "Same as camera") != "Same as camera":
             ow, oh = map(int, s["output_size"].split("x"))
             if (ow, oh) != (w, h):
                 out_size = (ow, oh)
@@ -1283,6 +1699,26 @@ def logo_pil(size, bg=None):
     d.ellipse([10 * k, 10 * k, 14 * k, 14 * k], fill=(255, 255, 255))
     d.ellipse([17 * k, 3.6 * k, 20.6 * k, 7.2 * k], fill=_rgb("#ff4d4d"))
     return img.resize((size, size), Image.LANCZOS)
+
+
+def qr_pil(text, size):
+    """QR code on a white rounded card (None if the qrcode package is missing)."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    q = qrcode.QRCode(border=0, box_size=10, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    q.add_data(text)
+    q.make(fit=True)
+    code = q.make_image(fill_color=(10, 14, 19), back_color=(255, 255, 255)).convert("RGB")
+    pad = int(size * 0.08)
+    code = code.resize((size - 2 * pad, size - 2 * pad), Image.NEAREST)
+    S = 3
+    card = Image.new("RGB", (size * S, size * S), _rgb(C["panel"]))
+    ImageDraw.Draw(card).rounded_rectangle([0, 0, size * S - 1, size * S - 1], radius=16 * S, fill=(255, 255, 255))
+    card = card.resize((size, size), Image.LANCZOS)
+    card.paste(code, (pad, pad))
+    return card
 
 
 def pill_rgba(text, fill, fg, dot=None, alpha=235, size=13, padx=12, h=28):
@@ -2116,9 +2552,16 @@ class App:
         p.pack(fill="both", expand=True, padx=22)
         self.caps(p, "Camera", first=True)
         r = self.row(p)
-        self.dd_cam = Dropdown(r, command=self.restart_if_running, placeholder="No webcam found")
+        self.cam_row = r
+        self.dd_cam = Dropdown(r, command=self.on_cam_selected, placeholder="No webcam found")
         self.dd_cam.pack(side="left", fill="x", expand=True)
         Btn(r, "", "refresh", "secondary", self.refresh_cameras, width=38, height=38).pack(side="left", padx=(8, 0))
+        self.phone_row = tk.Frame(p, bg=C["panel"])
+        self.phone_dot = tk.Label(self.phone_row, text="●", font=FONTS["body"], fg=C["faint"], bg=C["panel"])
+        self.phone_dot.pack(side="left")
+        self.phone_status = tk.Label(self.phone_row, text="", font=FONTS["small"], fg=C["muted"], bg=C["panel"])
+        self.phone_status.pack(side="left", padx=(6, 0))
+        Btn(self.phone_row, "Copy link", None, "ghost", self.copy_phone_link, height=30).pack(side="right")
         tk.Label(p, text="Camera resolution", font=FONTS["body"], fg=C["text"], bg=C["panel"]
                  ).pack(anchor="w", pady=(14, 6))
         Segmented(p, [("640x480", "480p"), ("1280x720", "720p"), ("1920x1080", "1080p")],
@@ -2206,9 +2649,28 @@ class App:
     def refresh_cameras(self):
         vdev = self.v_vdev.get().strip()
         self.cams = [(p, n) for p, n in list_cameras() if not is_virtual(n, p, vdev)]
+        self.cams.append((PHONE_ID, PHONE_LABEL))
         saved = self.s.get("camera")
         idx = next((i for i, (p, _) in enumerate(self.cams) if p == saved), 0)
         self.dd_cam.set_values([n for _, n in self.cams], idx)
+        self.on_cam_selected(restart=False)
+
+    def using_phone(self):
+        return self.cam_path() == PHONE_ID
+
+    def on_cam_selected(self, restart=True):
+        self.s["camera"] = self.cam_path()
+        if self.using_phone() and not PHONE.running:
+            if not PHONE.start():
+                self.alert("Phone camera unavailable", PHONE.error or "Unknown error")
+        if hasattr(self, "phone_row"):
+            if self.using_phone():
+                self.phone_row.pack(fill="x", pady=(10, 0), after=self.cam_row)
+            else:
+                self.phone_row.pack_forget()
+        self._empty_state = "redraw"
+        if restart:
+            self.restart_if_running()
 
     def cam_path(self):
         i = self.dd_cam.current() if hasattr(self, "dd_cam") else -1
@@ -2255,6 +2717,17 @@ class App:
         self._meter_kind = "sys"
         self.btn_test_sys.set(text="Stop", icon_name="stop")
         self.lbl_meter.configure(text="Play something on your PC…", fg=C["muted"])
+
+    def copy_phone_link(self):
+        if PHONE.url:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(PHONE.url)
+            self.toast("Phone link copied", kind="ok", ms=2500)
+
+    def phone_state(self):
+        if not self.using_phone():
+            return None
+        return "connected" if PHONE.connected else "waiting"
 
     def mic_name(self):
         i = self.dd_mic.current() if hasattr(self, "dd_mic") else 0
@@ -2592,10 +3065,14 @@ class App:
         frame = e.frame_out if (e is not None and e.is_alive()) else None
         if frame is None:
             starting = e is not None and e.is_alive()
-            if force or self._shown_frame is not None or getattr(self, "_empty_state", None) != starting:
+            state = (starting, self.phone_state(), (W, H))
+            if force or self._shown_frame is not None or getattr(self, "_empty_state", None) != state:
                 self._shown_frame = None
-                self._empty_state = starting
-                self.draw_empty(W, H, starting=starting)
+                self._empty_state = state
+                if self.using_phone():
+                    self.draw_phone_stage(W, H, running=starting)
+                else:
+                    self.draw_empty(W, H, starting=starting)
             return
         self._empty_state = None
         if frame is self._shown_frame and not force:
@@ -2661,6 +3138,50 @@ class App:
         cv.create_text(W // 2, cy + 8, text=sub, font=FONTS["body"], fill=C["muted"], tags="empty")
         if not starting:
             cv.create_window(W // 2, cy + 60, window=self.start_overlay, tags="empty")
+        cv.tag_raise("toast")
+
+    def draw_phone_stage(self, W, H, running=False):
+        """Camera source is the phone and no picture yet: show how to connect."""
+        cv = self.preview
+        cv.delete("video")
+        cv.delete("empty")
+        self._empty_bg = rr_image(W, H, 16, C["panel"], C["bg"], C["line"])
+        cv.create_image(0, 0, image=self._empty_bg, anchor="nw", tags="empty")
+        connected = PHONE.connected
+        qs = max(150, min(240, int(H * 0.42)))
+        cx, cy = W // 2, H // 2
+        left = cx - (qs + 48 + 360) // 2
+        qr = qr_pil(PHONE.url, qs) if PHONE.url else None
+        tx = left + qs + 48
+        top = cy - qs // 2
+        if qr is not None:
+            self._qr = ImageTk.PhotoImage(qr)
+            cv.create_image(left, top, image=self._qr, anchor="nw", tags="empty")
+        else:
+            tx, top = cx - 180, cy - 90
+        if connected:
+            title = "Phone connected" if not running else "Receiving from phone…"
+            sub = ("Press Start camera to use it." if not running
+                   else f"{PHONE.size[0]}×{PHONE.size[1]} · {PHONE.fps:.0f} fps")
+        else:
+            title = "Connect your phone"
+            sub = "Phone and PC on the same Wi-Fi."
+        cv.create_text(tx, top + 6, text=title, font=FONTS["hero"], fill=C["text"], anchor="nw", tags="empty")
+        cv.create_text(tx, top + 40, text=sub, font=FONTS["body"], fill=C["ok"] if connected else C["muted"],
+                       anchor="nw", tags="empty")
+        if not connected:
+            steps = ["1   Scan the QR code with your phone camera",
+                     "2   Tap “Advanced” → “Proceed” on the security warning",
+                     "3   Allow camera access, then tap Start"]
+            for i, st in enumerate(steps):
+                cv.create_text(tx, top + 82 + i * 26, text=st, font=FONTS["body"], fill=C["text"],
+                               anchor="nw", tags="empty")
+            cv.create_text(tx, top + 82 + 3 * 26 + 12, text=ellipsize(FONTS["small"], PHONE.url or "Starting…", 360),
+                           font=FONTS["small"], fill=C["faint"], anchor="nw", tags="empty")
+        elif not running:
+            cv.create_window(tx, top + 84, window=self.start_overlay, anchor="nw", tags="empty")
+        if not running and not connected:
+            pass
         cv.tag_raise("toast")
 
     # ---------------------------------------------------------- keys / icons
@@ -2754,8 +3275,20 @@ class App:
             self.chip_rec.set(f"REC {mins:02d}:{secs:02d}", "rec")
         self.chip_rec.show(self.recorder is not None)
 
+        # phone status (Setup tab)
+        if self.using_phone():
+            if PHONE.connected:
+                self.phone_dot.configure(fg=C["ok"])
+                self.phone_status.configure(
+                    text=f"Phone connected · {PHONE.size[0]}×{PHONE.size[1]} · {PHONE.fps:.0f} fps")
+            else:
+                self.phone_dot.configure(fg=C["warn"])
+                self.phone_status.configure(text="Waiting for phone — scan the QR in the preview")
+
         # status bar
-        if running and e.size != (0, 0):
+        if running and getattr(e, "waiting_phone", False):
+            self.lbl_stats.configure(text="Waiting for your phone — scan the QR code")
+        elif running and e.size != (0, 0):
             w, h = e.size
             self.lbl_stats.configure(
                 text=f"{w}×{h}   ·   {e.fps:.0f} fps   ·   {e.proc_ms:.0f} ms per frame   ·   "
@@ -2769,6 +3302,7 @@ class App:
 
     def on_close(self):
         self.save_settings()
+        PHONE.stop()
         if self.meter is not None:
             self.meter.stop()
         self.stop_engine()

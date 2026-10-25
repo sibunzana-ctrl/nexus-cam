@@ -10,6 +10,7 @@ NexusCam takes your real webcam, cuts you out of the frame, and puts a new backg
 
 - **Backgrounds:** None, Blur, Image, Video, Colour and Screen (share any window or monitor through the desktop's own picker)
 - **Presenter controls:** shrink yourself and move left or right so the chart stays visible
+- **Phone as camera over Wi-Fi:** scan a QR code, tap Start, and use your phone's camera. Nothing to install on the phone; works on Android and iPhone
 - **Virtual webcam** via v4l2loopback, so any app can use it
 - **Recording** to MP4 with microphone and/or computer audio (videos, TradingView alerts), mixed into one track; encodes on an NVIDIA GPU (NVENC) when available, otherwise on the CPU (x264)
 - **Mic picker with a live level meter**, plus an automatic check that warns you if a recording's audio is silent
@@ -41,6 +42,15 @@ bash setup.sh
 4. **Go live**, then select **NexusCam** as the camera in your call or streaming app.
 5. **Record** saves to `~/Videos/NexusCam/`.
 
+## Phone camera
+
+1. **Setup** tab → Camera → **Phone camera (Wi-Fi)**. A QR code appears in the preview.
+2. Scan it with your phone (phone and PC on the same Wi-Fi).
+3. The browser shows a security warning, because NexusCam uses its own certificate. Tap **Advanced → Proceed**. This only happens once per phone.
+4. Allow camera access and tap **Start**, then press **Start camera** in NexusCam.
+
+Use **Front/Back** and **720p/1080p** on the phone page. Hold the phone sideways for a landscape picture. The link contains a private key, so other devices on your network can't send video to NexusCam.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -53,6 +63,7 @@ bash setup.sh
 | Computer audio heard twice / echo | Use headphones, so the mic doesn't also pick up your speakers |
 | Screen share errors | See `~/.nexuscam/screen.log` |
 | Recording errors | See `~/.nexuscam/ffmpeg.log` |
+| Phone page won't load | Phone and PC must be on the same Wi-Fi; some routers' "guest" networks block devices from seeing each other. If you use a firewall: `sudo ufw allow 8765/tcp` |
 
 Settings are stored in `~/.nexuscam/settings.json`.
 
