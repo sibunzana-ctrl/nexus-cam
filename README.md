@@ -10,7 +10,7 @@ NexusCam takes your real webcam, cuts you out of the frame, and puts a new backg
 
 - **Backgrounds:** None, Blur, Image, Video, Colour and Screen (share any window or monitor through the desktop's own picker)
 - **Presenter controls:** shrink yourself and move left or right so the chart stays visible
-- **Phone as camera over Wi-Fi:** scan a QR code, tap Start, and use your phone's camera. Nothing to install on the phone; works on Android and iPhone
+- **Phone as camera**, two ways: **Wi-Fi** (scan a QR code; Android and iPhone) or **USB cable** (Android; works even when the router blocks devices from seeing each other). Nothing to install on the phone
 - **Virtual webcam** via v4l2loopback, so any app can use it
 - **Recording** to MP4 with microphone and/or computer audio (videos, TradingView alerts), mixed into one track; encodes on an NVIDIA GPU (NVENC) when available, otherwise on the CPU (x264)
 - **Mic picker with a live level meter**, plus an automatic check that warns you if a recording's audio is silent
@@ -44,12 +44,23 @@ bash setup.sh
 
 ## Phone camera
 
+### Wi-Fi
+
 1. **Setup** tab → Camera → **Phone camera (Wi-Fi)**. A QR code appears in the preview.
 2. Scan it with your phone (phone and PC on the same Wi-Fi).
 3. The browser shows a security warning, because NexusCam uses its own certificate. Tap **Advanced → Proceed**. This only happens once per phone.
 4. Allow camera access and tap **Start**, then press **Start camera** in NexusCam.
 
 Use **Front/Back** and **720p/1080p** on the phone page. Hold the phone sideways for a landscape picture. The link contains a private key, so other devices on your network can't send video to NexusCam.
+
+### USB cable (Android)
+
+Use this if the Wi-Fi page won't load. Some routers have "AP isolation", which stops devices on the same Wi-Fi from reaching each other.
+
+1. One-time setup on the phone: **Settings → About phone → Software information → tap Build number 7 times**, then **Settings → Developer options → turn on USB debugging**.
+2. **Setup** tab → Camera → **Phone camera (USB cable)**.
+3. Plug the phone in and tap **Allow** on the "Allow USB debugging?" prompt (tick *Always allow*).
+4. Press **Open on phone** in NexusCam. The page opens in your phone's browser with no security warning. Tap **Start**.
 
 ## Troubleshooting
 
@@ -63,7 +74,7 @@ Use **Front/Back** and **720p/1080p** on the phone page. Hold the phone sideways
 | Computer audio heard twice / echo | Use headphones, so the mic doesn't also pick up your speakers |
 | Screen share errors | See `~/.nexuscam/screen.log` |
 | Recording errors | See `~/.nexuscam/ffmpeg.log` |
-| Phone page won't load | Phone and PC must be on the same Wi-Fi; some routers' "guest" networks block devices from seeing each other. If you use a firewall: `sudo ufw allow 8765/tcp` |
+| Phone page won't load (Wi-Fi) | Use **Phone camera (USB cable)** instead. Otherwise, phone and PC must be on the same Wi-Fi; some routers' "guest" networks block devices from seeing each other. If you use a firewall: `sudo ufw allow 8765/tcp` |
 
 Settings are stored in `~/.nexuscam/settings.json`.
 

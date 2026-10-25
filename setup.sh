@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NexusCam installer for Pop!_OS / Ubuntu  (v6 — phone camera)
+# NexusCam installer for Pop!_OS / Ubuntu  (v7 — phone camera: Wi-Fi + USB)
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -7,7 +7,7 @@ echo "==> Installing system packages (virtual camera, Tk, screen capture)"
 sudo apt update
 sudo apt install -y v4l2loopback-dkms v4l2loopback-utils python3-venv python3-tk \
   python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-pipewire \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good xdg-desktop-portal ffmpeg v4l-utils pulseaudio-utils zenity gstreamer1.0-libav openssl
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good xdg-desktop-portal ffmpeg v4l-utils pulseaudio-utils zenity gstreamer1.0-libav openssl adb
 
 echo "==> Loading the NexusCam virtual camera at /dev/video10"
 if [ ! -e /dev/video10 ]; then

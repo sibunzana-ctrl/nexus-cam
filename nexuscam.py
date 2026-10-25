@@ -449,7 +449,11 @@ from urllib.parse import urlparse, parse_qs
 
 PHONE_ID = "phone:wifi"
 PHONE_LABEL = "Phone camera (Wi-Fi)"
+PHONE_USB_ID = "phone:usb"
+PHONE_USB_LABEL = "Phone camera (USB cable)"
+PHONE_IDS = (PHONE_ID, PHONE_USB_ID)
 PHONE_PORT = 8765
+PHONE_USB_PORT = 8780  # port the phone opens on its side; adb forwards it to us
 PHONE_CERT = os.path.join(APP_DIR, "phone_cert.pem")
 PHONE_KEY = os.path.join(APP_DIR, "phone_key.pem")
 PHONE_TOKEN_FILE = os.path.join(APP_DIR, "phone_token")
@@ -465,6 +469,50 @@ def lan_ip():
         return ip
     except OSError:
         return "127.0.0.1"
+
+
+def adb_status():
+    """('missing'|'none'|'unauthorized'|'offline'|'ready', model name)."""
+    if not shutil.which("adb"):
+        return "missing", ""
+    try:
+        out = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return "none", ""
+    states = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        model = next((p.split(":", 1)[1].replace("_", " ") for p in parts if p.startswith("model:")), "")
+        states.append((parts[1], model))
+    for st, model in states:
+        if st == "device":
+            return "ready", model or "Android phone"
+    if any(st == "unauthorized" for st, _ in states):
+        return "unauthorized", ""
+    if states:
+        return "offline", ""
+    return "none", ""
+
+
+def adb_reverse(local_port):
+    """Make localhost:PHONE_USB_PORT on the phone reach NexusCam over the cable."""
+    try:
+        r = subprocess.run(["adb", "reverse", f"tcp:{PHONE_USB_PORT}", f"tcp:{local_port}"],
+                           capture_output=True, text=True, timeout=10)
+        return None if r.returncode == 0 else (r.stderr.strip() or "adb reverse failed")
+    except Exception as e:
+        return str(e)
+
+
+def adb_open_url(url):
+    try:
+        r = subprocess.run(["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url],
+                           capture_output=True, text=True, timeout=10)
+        return None if r.returncode == 0 else (r.stderr.strip() or "Couldn't open the browser on the phone")
+    except Exception as e:
+        return str(e)
 
 
 def ensure_phone_cert():
@@ -503,6 +551,8 @@ class PhoneServer:
         self.token = phone_token()
         self.port = None
         self.httpd = None
+        self.usb_port = None
+        self.httpd_usb = None
         self.error = None
         self.latest = None
         self.seq = 0
@@ -515,7 +565,36 @@ class PhoneServer:
 
     @property
     def running(self):
-        return self.httpd is not None
+        return self.httpd is not None or self.httpd_usb is not None
+
+    @property
+    def usb_url(self):
+        return f"http://localhost:{PHONE_USB_PORT}/?k={self.token}"
+
+    def start_usb(self):
+        """Plain HTTP on 127.0.0.1 only. Over the USB cable the phone reaches it as
+        'localhost', which browsers treat as secure — so no certificate warning."""
+        if self.httpd_usb is not None:
+            return True
+        last_err = None
+        for port in range(PHONE_USB_PORT, PHONE_USB_PORT + 10):
+            try:
+                httpd = ThreadingHTTPServer(("127.0.0.1", port), _PhoneHandler)
+                break
+            except OSError as e:
+                last_err = e
+        else:
+            self.error = f"Couldn't open a local port for the phone:\n{last_err}"
+            return False
+        httpd.daemon_threads = True
+        httpd.handle_error = lambda request, client_address: None
+        httpd.phone = self
+        self.httpd_usb, self.usb_port = httpd, port
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return True
+
+    def start_for(self, cam_id):
+        return self.start_usb() if cam_id == PHONE_USB_ID else self.start()
 
     @property
     def connected(self):
@@ -557,13 +636,15 @@ class PhoneServer:
         return True
 
     def stop(self):
-        if self.httpd is not None:
-            try:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-            except Exception:
-                pass
-            self.httpd = None
+        for attr in ("httpd", "httpd_usb"):
+            srv = getattr(self, attr)
+            if srv is not None:
+                try:
+                    srv.shutdown()
+                    srv.server_close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         with self._cond:
             self._cond.notify_all()
 
@@ -586,7 +667,7 @@ class PhoneServer:
 
     def wait_frame(self, last_seq, timeout=1.0):
         with self._cond:
-            self._cond.wait_for(lambda: self.seq != last_seq or self.httpd is None, timeout)
+            self._cond.wait_for(lambda: self.seq != last_seq or not self.running, timeout)
             return self.seq, self.latest
 
     def capture(self):
@@ -795,7 +876,7 @@ function loop(){
 async function start(){
   error("");
   if (!window.isSecureContext || !navigator.mediaDevices) {
-    error("The camera is blocked on this page. Open the link from the QR code (it starts with https://) and accept the security warning.");
+    error("The camera is blocked on this page. Open it from NexusCam — scan the QR code (and accept the security warning) or use Open on phone with a USB cable.");
     return;
   }
   go.disabled = true; status("Starting camera…", "wait");
@@ -1203,10 +1284,10 @@ class Engine(threading.Thread):
         w, h = map(int, s["resolution"].split("x"))
         fps = int(s["fps"])
 
-        phone = s["camera"] == PHONE_ID
+        phone = s["camera"] in PHONE_IDS
         if phone:
             # wait (as long as it takes) for the phone to start sending
-            if not PHONE.start():
+            if not PHONE.start_for(s["camera"]):
                 self.error = PHONE.error
                 self.running = False
                 return
@@ -2561,7 +2642,8 @@ class App:
         self.phone_dot.pack(side="left")
         self.phone_status = tk.Label(self.phone_row, text="", font=FONTS["small"], fg=C["muted"], bg=C["panel"])
         self.phone_status.pack(side="left", padx=(6, 0))
-        Btn(self.phone_row, "Copy link", None, "ghost", self.copy_phone_link, height=30).pack(side="right")
+        self.btn_copy_link = Btn(self.phone_row, "Copy link", None, "ghost", self.copy_phone_link, height=30)
+        self.btn_open_phone_small = Btn(self.phone_row, "Open on phone", None, "ghost", self.open_on_phone, height=30)
         tk.Label(p, text="Camera resolution", font=FONTS["body"], fg=C["text"], bg=C["panel"]
                  ).pack(anchor="w", pady=(14, 6))
         Segmented(p, [("640x480", "480p"), ("1280x720", "720p"), ("1920x1080", "1080p")],
@@ -2650,22 +2732,31 @@ class App:
         vdev = self.v_vdev.get().strip()
         self.cams = [(p, n) for p, n in list_cameras() if not is_virtual(n, p, vdev)]
         self.cams.append((PHONE_ID, PHONE_LABEL))
+        self.cams.append((PHONE_USB_ID, PHONE_USB_LABEL))
         saved = self.s.get("camera")
         idx = next((i for i, (p, _) in enumerate(self.cams) if p == saved), 0)
         self.dd_cam.set_values([n for _, n in self.cams], idx)
         self.on_cam_selected(restart=False)
 
     def using_phone(self):
-        return self.cam_path() == PHONE_ID
+        return self.cam_path() in PHONE_IDS
+
+    def using_usb(self):
+        return self.cam_path() == PHONE_USB_ID
 
     def on_cam_selected(self, restart=True):
         self.s["camera"] = self.cam_path()
-        if self.using_phone() and not PHONE.running:
-            if not PHONE.start():
+        if self.using_phone():
+            if not PHONE.start_for(self.cam_path()):
                 self.alert("Phone camera unavailable", PHONE.error or "Unknown error")
+        if self.using_usb():
+            self.start_adb_watch()
         if hasattr(self, "phone_row"):
             if self.using_phone():
                 self.phone_row.pack(fill="x", pady=(10, 0), after=self.cam_row)
+                self.btn_copy_link.pack_forget()
+                self.btn_open_phone_small.pack_forget()
+                (self.btn_open_phone_small if self.using_usb() else self.btn_copy_link).pack(side="right")
             else:
                 self.phone_row.pack_forget()
         self._empty_state = "redraw"
@@ -2718,6 +2809,45 @@ class App:
         self.btn_test_sys.set(text="Stop", icon_name="stop")
         self.lbl_meter.configure(text="Play something on your PC…", fg=C["muted"])
 
+    def start_adb_watch(self):
+        """Poll 'adb devices' in the background while the USB source is selected,
+        and keep the cable route (adb reverse) set up whenever a phone is ready."""
+        if getattr(self, "_adb_thread", None) is not None and self._adb_thread.is_alive():
+            return
+        self.adb_state = getattr(self, "adb_state", ("none", ""))
+
+        def watch():
+            was_ready = False
+            while not getattr(self, "_closing", False) and self.using_usb():
+                st = adb_status()
+                if st[0] == "ready" and (not was_ready or not PHONE.connected):
+                    err = adb_reverse(PHONE.usb_port or PHONE_USB_PORT)
+                    if err:
+                        st = ("offline", err)
+                was_ready = st[0] == "ready"
+                self.adb_state = st
+                time.sleep(2)
+        self._adb_thread = threading.Thread(target=watch, daemon=True)
+        self._adb_thread.start()
+
+    def open_on_phone(self):
+        state, _ = getattr(self, "adb_state", ("none", ""))
+        if state == "missing":
+            self.alert("adb is not installed", "USB mode needs adb.\n\nRun:  sudo apt install adb")
+            return
+        if state != "ready":
+            self.alert("Phone not ready", "Plug the phone in with a USB cable, turn on USB debugging, "
+                                          "and tap Allow on the phone.")
+            return
+        if not PHONE.start_usb():
+            self.alert("Phone camera unavailable", PHONE.error or "Unknown error")
+            return
+        err = adb_reverse(PHONE.usb_port) or adb_open_url(PHONE.usb_url)
+        if err:
+            self.alert("Couldn't open the page on your phone", err)
+        else:
+            self.toast("Opened on your phone — tap Start there", kind="ok", ms=4000)
+
     def copy_phone_link(self):
         if PHONE.url:
             self.root.clipboard_clear()
@@ -2727,7 +2857,11 @@ class App:
     def phone_state(self):
         if not self.using_phone():
             return None
-        return "connected" if PHONE.connected else "waiting"
+        if PHONE.connected:
+            return "connected"
+        if self.using_usb():
+            return "usb:" + getattr(self, "adb_state", ("none", ""))[0]
+        return "waiting"
 
     def mic_name(self):
         i = self.dd_mic.current() if hasattr(self, "dd_mic") else 0
@@ -3069,7 +3203,9 @@ class App:
             if force or self._shown_frame is not None or getattr(self, "_empty_state", None) != state:
                 self._shown_frame = None
                 self._empty_state = state
-                if self.using_phone():
+                if self.using_usb() and not PHONE.connected:
+                    self.draw_usb_stage(W, H, running=starting)
+                elif self.using_phone():
                     self.draw_phone_stage(W, H, running=starting)
                 else:
                     self.draw_empty(W, H, starting=starting)
@@ -3140,6 +3276,51 @@ class App:
             cv.create_window(W // 2, cy + 60, window=self.start_overlay, tags="empty")
         cv.tag_raise("toast")
 
+    def draw_usb_stage(self, W, H, running=False):
+        """USB source, no picture yet: guide through cable + USB debugging."""
+        cv = self.preview
+        cv.delete("video")
+        cv.delete("empty")
+        self._empty_bg = rr_image(W, H, 16, C["panel"], C["bg"], C["line"])
+        cv.create_image(0, 0, image=self._empty_bg, anchor="nw", tags="empty")
+        state, model = getattr(self, "adb_state", ("none", ""))
+        x, top = W // 2 - 250, H // 2 - 130
+        self._usb_ic = icon("camera", 40, C["accent_hi"] if state == "ready" else C["faint"], C["panel"])
+        cv.create_image(x, top, image=self._usb_ic, anchor="nw", tags="empty")
+        tx = x + 60
+        if state == "missing":
+            title, sub, steps = ("USB mode needs adb", "Run setup.sh again, or:  sudo apt install adb", [])
+        elif state == "ready":
+            title = f"{model} connected"
+            sub = "Press Open on phone, then tap Start on the phone."
+            steps = []
+        elif state == "unauthorized":
+            title, sub = "Allow USB debugging on your phone", "A prompt is waiting on the phone screen."
+            steps = ["Tick “Always allow from this computer”", "Tap Allow"]
+        else:
+            title, sub = "Connect your phone with a USB cable", "One-time setup on the phone:"
+            steps = ["Settings → About phone → Software information →\n      tap Build number 7 times",
+                     "Settings → Developer options → turn on USB debugging",
+                     "Plug the phone into this PC and tap Allow"]
+        cv.create_text(tx, top + 2, text=title, font=FONTS["hero"], fill=C["text"], anchor="nw", tags="empty")
+        cv.create_text(tx, top + 36, text=sub, font=FONTS["body"],
+                       fill=C["ok"] if state == "ready" else C["muted"], anchor="nw", tags="empty")
+        y = top + 78
+        for i, st in enumerate(steps):
+            item = cv.create_text(tx, y, text=f"{i + 1}   {st}", font=FONTS["body"], fill=C["text"],
+                                  anchor="nw", tags="empty")
+            bb = cv.bbox(item)
+            y = (bb[3] if bb else y + 20) + 10
+        if state == "ready":
+            if not hasattr(self, "btn_open_phone"):
+                self.btn_open_phone = Btn(self.preview, "Open on phone", "live", "primary", self.open_on_phone,
+                                          bg=C["panel"], width=190, height=44, radius=10, icon_size=18)
+            cv.create_window(tx, y + 4, window=self.btn_open_phone, anchor="nw", tags="empty")
+        if state != "ready" and state != "missing":
+            cv.create_text(tx, y + 14, text="No cable? Use “Phone camera (Wi-Fi)” in Setup instead.",
+                           font=FONTS["small"], fill=C["faint"], anchor="nw", tags="empty")
+        cv.tag_raise("toast")
+
     def draw_phone_stage(self, W, H, running=False):
         """Camera source is the phone and no picture yet: show how to connect."""
         cv = self.preview
@@ -3151,7 +3332,7 @@ class App:
         qs = max(150, min(240, int(H * 0.42)))
         cx, cy = W // 2, H // 2
         left = cx - (qs + 48 + 360) // 2
-        qr = qr_pil(PHONE.url, qs) if PHONE.url else None
+        qr = qr_pil(PHONE.url, qs) if (PHONE.url and not self.using_usb()) else None
         tx = left + qs + 48
         top = cy - qs // 2
         if qr is not None:
@@ -3281,13 +3462,23 @@ class App:
                 self.phone_dot.configure(fg=C["ok"])
                 self.phone_status.configure(
                     text=f"Phone connected · {PHONE.size[0]}×{PHONE.size[1]} · {PHONE.fps:.0f} fps")
+            elif self.using_usb():
+                st, model = getattr(self, "adb_state", ("none", ""))
+                text, col = {
+                    "ready": (f"{model} on USB — press Open on phone", C["ok"]),
+                    "unauthorized": ("Tap Allow on the phone", C["warn"]),
+                    "missing": ("adb not installed — run setup.sh", C["live_hi"]),
+                }.get(st, ("Plug in your phone (USB debugging on)", C["warn"]))
+                self.phone_dot.configure(fg=col)
+                self.phone_status.configure(text=text)
             else:
                 self.phone_dot.configure(fg=C["warn"])
                 self.phone_status.configure(text="Waiting for phone — scan the QR in the preview")
 
         # status bar
         if running and getattr(e, "waiting_phone", False):
-            self.lbl_stats.configure(text="Waiting for your phone — scan the QR code")
+            self.lbl_stats.configure(text="Waiting for your phone — " + (
+                "press Open on phone" if self.using_usb() else "scan the QR code"))
         elif running and e.size != (0, 0):
             w, h = e.size
             self.lbl_stats.configure(
@@ -3302,6 +3493,7 @@ class App:
 
     def on_close(self):
         self.save_settings()
+        self._closing = True
         PHONE.stop()
         if self.meter is not None:
             self.meter.stop()
