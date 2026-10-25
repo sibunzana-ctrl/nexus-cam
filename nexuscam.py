@@ -66,6 +66,7 @@ DEFAULTS = {
     "presenter_pos": "Centre", "presenter_size": 100,
     "output_size": "Same as camera",
     "record_audio": True, "mic_source": "",
+    "record_system": False, "system_source": "@DEFAULT_MONITOR@",
     "record_dir": os.path.join(os.path.expanduser("~"), "Videos", "NexusCam"),
 }
 
@@ -598,12 +599,20 @@ class Recorder:
 
     MIC_INPUT = ["-f", "pulse", "-i", "default"]
 
-    def __init__(self, w, h, fps, path, audio=True, audio_input=None, source=""):
+    def __init__(self, w, h, fps, path, audio=True, audio_input=None, source="",
+                 system_audio=False, system_source="@DEFAULT_MONITOR@", system_input=None):
+        """audio = record the mic; system_audio = record what the PC plays.
+        audio_input / system_input override the ffmpeg input args (tests)."""
         self.path = path
         self.audio = audio
+        self.system_audio = system_audio
         self.warning = None
-        if audio and audio_input is None:
-            audio_input = ["-f", "pulse", "-i", source or "default"]
+        inputs = []
+        if audio:
+            inputs.append(audio_input or ["-f", "pulse", "-i", source or "default"])
+        if system_audio:
+            inputs.append(system_input or ["-f", "pulse", "-i", system_source or "@DEFAULT_MONITOR@"])
+        self.has_audio = bool(inputs)
         self.started = time.time()
         self.dropped = 0
         self.error = None
@@ -612,11 +621,21 @@ class Recorder:
                "-thread_queue_size", "512",
                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                "-use_wallclock_as_timestamps", "1", "-i", "-"]
-        if audio:
-            cmd += ["-thread_queue_size", "1024"] + (audio_input or self.MIC_INPUT)
+        for inp in inputs:
+            cmd += ["-thread_queue_size", "1024"] + inp
         cmd += ["-map", "0:v"]
-        if audio:
-            cmd += ["-map", "1:a", "-c:a", "aac", "-b:a", "160k", "-af", "aresample=async=1"]
+        if len(inputs) == 1:
+            cmd += ["-map", "1:a", "-af", "aresample=async=1"]
+        elif len(inputs) == 2:
+            # mic + computer audio -> one track, each at full level
+            cmd += ["-filter_complex",
+                    "[1:a]aresample=48000:async=1,aformat=channel_layouts=stereo[m];"
+                    "[2:a]aresample=48000:async=1,aformat=channel_layouts=stereo[s];"
+                    "[m][s]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
+                    "alimiter=limit=0.97[a]",
+                    "-map", "[a]"]
+        if inputs:
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
         if nvenc_available():  # RTX GPU does the encoding; CPU stays free for the cut-out
             self.encoder = "GPU (NVENC)"
             cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr",
@@ -624,8 +643,8 @@ class Recorder:
         else:
             self.encoder = "CPU (x264)"
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-        if audio:
-            cmd += ["-shortest"]  # trim the mic tail to where the video ends
+        if inputs:
+            cmd += ["-shortest"]  # trim the audio tail to where the video ends
         cmd += ["-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", str(fps),
                 "-movflags", "+faststart", path]
         self._log = open(self.log_path, "w")
@@ -697,9 +716,9 @@ class Recorder:
             return "Recording failed.\n\n" + (self._log_tail() or "ffmpeg exited unexpectedly.")
         if not mp4_is_playable(self.path):
             return "Recording finished but the file is not playable.\n\n" + self._log_tail()
-        if self.audio:
+        if self.has_audio:
             peak = audio_peak_db(self.path)
-            if peak is not None and peak < -50:
+            if peak is not None and peak < -50 and self.audio:
                 self.warning = (f"The video saved, but its sound is silent (loudest point "
                                 f"{peak:.0f} dB).\n\nThe selected microphone isn't hearing you. "
                                 "Pick another input under Record and press 'Test' — "
@@ -1830,6 +1849,8 @@ class App:
         self.v_pos = tk.StringVar(value=s["presenter_pos"] if s["presenter_pos"] in POSITIONS else "Centre")
         self.v_psize = tk.IntVar(value=s["presenter_size"])
         self.v_mic = tk.BooleanVar(value=s["record_audio"])
+        self.v_sys = tk.BooleanVar(value=s.get("record_system", False))
+        self.sys_sources = []
         self.v_recdir = tk.StringVar(value=s.get("record_dir") or DEFAULTS["record_dir"])
         self.v_tab = tk.StringVar(value="scene")
         for v in (self.v_blur, self.v_soft, self.v_thr, self.v_smooth, self.v_mirror, self.v_invert,
@@ -1859,6 +1880,8 @@ class App:
             "presenter_size": int(self.v_psize.get()),
             "output_size": self.v_out.get(),
             "record_audio": bool(self.v_mic.get()),
+            "record_system": bool(self.v_sys.get()),
+            "system_source": self.sys_name(),
             "mic_source": self.mic_name(),
             "record_dir": self.v_recdir.get() or DEFAULTS["record_dir"],
         }
@@ -2076,8 +2099,17 @@ class App:
         self.lbl_meter.pack(side="left")
         self.btn_test = Btn(r, "Test", "mic", "secondary", self.toggle_meter, width=88)
         self.btn_test.pack(side="right")
-        self.hint(p, "“Computer audio” inputs record what your laptop plays — TradingView "
-                     "alerts, for example — instead of your voice.", pady=(18, 0))
+        self.caps(p, "Computer audio")
+        Switch(p, "Record computer audio", self.v_sys,
+               sub="Videos, TradingView alerts — anything your PC plays").pack(fill="x")
+        tk.Label(p, text="Source", font=FONTS["body"], fg=C["text"], bg=C["panel"]).pack(anchor="w", pady=(14, 6))
+        r = self.row(p)
+        self.dd_sys = Dropdown(r, command=self.on_sys_change, placeholder="What you hear")
+        self.dd_sys.pack(side="left", fill="x", expand=True)
+        self.btn_test_sys = Btn(r, "Test", "live", "secondary", self.toggle_sys_meter, width=88, height=38)
+        self.btn_test_sys.pack(side="left", padx=(8, 0))
+        self.hint(p, "Mixed with your mic into one track. Use headphones if your speakers "
+                     "are loud, or your mic will pick the sound up twice.", pady=(10, 0))
 
     def build_setup(self, p):
         p = tk.Frame(p, bg=C["panel"])
@@ -2132,7 +2164,7 @@ class App:
         for k, f in self.pages.items():
             f.pack_forget()
         self.pages[self.v_tab.get()].pack(fill="both", expand=True)
-        if self.v_tab.get() != "audio" and self.meter is not None:
+        if self.v_tab.get() != "audio" and getattr(self, "meter", None) is not None:
             self.toggle_meter()
 
     def show_context(self):
@@ -2187,8 +2219,42 @@ class App:
         saved = self.s.get("mic_source", "")
         idx = next((i + 1 for i, (n, _) in enumerate(self.mics) if n == saved), 0)
         self.dd_mic.set_values(["System default input"] + [lbl for _, lbl in self.mics], idx)
+        if hasattr(self, "dd_sys"):
+            self.refresh_sys_sources()
         if not self.mics and not shutil.which("pactl"):
             self.lbl_meter.configure(text="Run setup.sh to list inputs.")
+
+    def refresh_sys_sources(self):
+        mons = [(n, lbl.replace("Computer audio: ", "")) for n, lbl in self.mics if n.endswith(".monitor")]
+        self.sys_sources = [("@DEFAULT_MONITOR@", "What you hear (current output)")] + mons
+        saved = self.s.get("system_source", "@DEFAULT_MONITOR@")
+        idx = next((i for i, (n, _) in enumerate(self.sys_sources) if n == saved), 0)
+        self.dd_sys.set_values([lbl for _, lbl in self.sys_sources], idx)
+
+    def sys_name(self):
+        i = self.dd_sys.current() if hasattr(self, "dd_sys") else 0
+        return self.sys_sources[i][0] if 0 <= i < len(self.sys_sources) else "@DEFAULT_MONITOR@"
+
+    def on_sys_change(self):
+        self.s["system_source"] = self.sys_name()
+        if self.meter is not None and getattr(self, "_meter_kind", "mic") == "sys":
+            self.toggle_sys_meter()
+            self.toggle_sys_meter()
+
+    def toggle_sys_meter(self):
+        """Same meter, pointed at computer audio. Play a video and watch it move."""
+        if self.meter is not None and getattr(self, "_meter_kind", "mic") == "sys":
+            self.toggle_meter()
+            return
+        if self.meter is not None:
+            self.toggle_meter()
+        if shutil.which("ffmpeg") is None:
+            self.alert("ffmpeg is missing", "Run setup.sh to install it.")
+            return
+        self.meter = MicMeter(self.sys_name())
+        self._meter_kind = "sys"
+        self.btn_test_sys.set(text="Stop", icon_name="stop")
+        self.lbl_meter.configure(text="Play something on your PC…", fg=C["muted"])
 
     def mic_name(self):
         i = self.dd_mic.current() if hasattr(self, "dd_mic") else 0
@@ -2204,7 +2270,9 @@ class App:
         if self.meter is not None:
             self.meter.stop()
             self.meter = None
+            self._meter_kind = "mic"
             self.btn_test.set(text="Test", icon_name="mic")
+            self.btn_test_sys.set(text="Test", icon_name="live")
             self.level.set_level(None)
             self.lbl_meter.configure(text="Press Test, then speak.", fg=C["muted"])
         else:
@@ -2212,6 +2280,7 @@ class App:
                 self.alert("ffmpeg is missing", "Run setup.sh to install it.")
                 return
             self.meter = MicMeter(self.mic_name())
+            self._meter_kind = "mic"
             self.btn_test.set(text="Stop", icon_name="stop")
 
     def draw_meter(self):
@@ -2225,6 +2294,12 @@ class App:
             return
         db = m.level
         self.level.set_level(db)
+        if getattr(self, "_meter_kind", "mic") == "sys":
+            if db > -50:
+                self.lbl_meter.configure(text="Computer audio  ✓", fg=C["ok"])
+            else:
+                self.lbl_meter.configure(text="Play something on your PC…", fg=C["muted"])
+            return
         if db > -40:
             self.lbl_meter.configure(text="Hearing you  ✓", fg=C["ok"])
         elif db > -55:
@@ -2390,7 +2465,8 @@ class App:
             os.makedirs(d, exist_ok=True)
             path = os.path.join(d, time.strftime("NexusCam_%Y-%m-%d_%H-%M-%S.mp4"))
             self.recorder = Recorder(w, h, DEFAULTS["fps"], path, audio=bool(self.v_mic.get()),
-                                     source=self.mic_name())
+                                     source=self.mic_name(), system_audio=bool(self.v_sys.get()),
+                                     system_source=self.sys_name())
         except Exception as e:
             self.recorder = None
             self.alert("Couldn't start recording", str(e))

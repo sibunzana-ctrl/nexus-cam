@@ -11,7 +11,7 @@ NexusCam takes your real webcam, cuts you out of the frame, and puts a new backg
 - **Backgrounds:** None, Blur, Image, Video, Colour and Screen (share any window or monitor through the desktop's own picker)
 - **Presenter controls:** shrink yourself and move left or right so the chart stays visible
 - **Virtual webcam** via v4l2loopback, so any app can use it
-- **Recording** to MP4 with microphone audio; encodes on an NVIDIA GPU (NVENC) when available, otherwise on the CPU (x264)
+- **Recording** to MP4 with microphone and/or computer audio (videos, TradingView alerts), mixed into one track; encodes on an NVIDIA GPU (NVENC) when available, otherwise on the CPU (x264)
 - **Mic picker with a live level meter**, plus an automatic check that warns you if a recording's audio is silent
 - **1080p output** even from a 720p webcam, so charts stay sharp
 - **Fast:** about 8–13 ms per 1080p frame for compositing
@@ -49,6 +49,8 @@ bash setup.sh
 | Halo or flicker around your head | Raise **Cut-out tightness** and **Flicker smoothing**; add light on your face |
 | Webcam stuck at 15 fps | More light on your face (NexusCam already disables the camera's low-light frame-rate drop) |
 | Silent recording | Audio tab → pick another input and press **Test**; use the one whose meter moves |
+| Video plays but no sound in the player | `sudo apt install gstreamer1.0-libav` (setup.sh does this) — the player was missing its AAC decoder |
+| Computer audio heard twice / echo | Use headphones, so the mic doesn't also pick up your speakers |
 | Screen share errors | See `~/.nexuscam/screen.log` |
 | Recording errors | See `~/.nexuscam/ffmpeg.log` |
 
