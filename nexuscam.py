@@ -598,7 +598,7 @@ class PhoneServer:
 
     @property
     def connected(self):
-        return time.time() - self.last_time < 2.5
+        return time.time() - self.last_time < 6.0
 
     @property
     def url(self):
@@ -815,6 +815,8 @@ const pill = document.getElementById("pill"), ptxt = document.getElementById("pt
 const msg = document.getElementById("msg"), turn = document.getElementById("turn"), empty = document.getElementById("empty");
 let facing = "user", quality = 1280, stream = null, running = false, inflight = 0, wake = null;
 let sent = 0, t0 = performance.now(), failing = 0;
+// adapts to the link: shrinks quality, then size, when frames take too long to send
+let jq = 0.8, maxW = 1280, rtt = 0, gotFirst = false;
 const c = document.createElement("canvas"), ctx = c.getContext("2d");
 
 function status(text, kind){ ptxt.textContent = text; pill.className = "pill " + (kind||""); }
@@ -829,7 +831,7 @@ function seg(id, cb){
   });
 }
 seg("facing", async val => { facing = val; if (stream) await openCam(); });
-seg("quality", async val => { quality = +val; if (stream) await openCam(); });
+seg("quality", async val => { quality = +val; maxW = quality; jq = 0.8; if (stream) await openCam(); });
 
 async function openCam(){
   if (stream) stream.getTracks().forEach(t => t.stop());
@@ -848,14 +850,33 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden" && running) status("Paused — reopen this page", "wait");
 });
 
+function adapt(ms){
+  rtt = rtt ? rtt * 0.8 + ms * 0.2 : ms;
+  if (rtt > 220) {                     // link can't keep up: cheaper frames
+    if (jq > 0.55) jq = Math.max(0.55, jq - 0.07);
+    else if (maxW > 640) maxW = Math.max(640, Math.round(maxW * 0.8));
+    rtt *= 0.7;
+  } else if (rtt < 70) {               // plenty of room: claw quality back
+    if (maxW < quality) maxW = Math.min(quality, Math.round(maxW * 1.1));
+    else if (jq < 0.8) jq = Math.min(0.8, jq + 0.02);
+  }
+}
+
 function send(blob){
   inflight++;
+  const t = performance.now();
   fetch("/frame?k=" + K, {method:"POST", body: blob, headers:{"Content-Type":"image/jpeg"}, cache:"no-store"})
     .then(r => {
       if (r.status === 403) { stop(); error("This link is out of date. Scan the QR code in NexusCam again."); return; }
       failing = 0; sent++;
       const now = performance.now();
-      if (now - t0 > 1000) { status("Connected · " + Math.round(sent * 1000 / (now - t0)) + " fps", "live"); sent = 0; t0 = now; }
+      adapt(now - t);
+      if (!gotFirst || now - t0 > 1000) {
+        const fps = gotFirst ? Math.round(sent * 1000 / (now - t0)) : 1;
+        const slow = maxW < quality || jq < 0.7;
+        status("Connected · " + fps + " fps" + (slow ? " · slow Wi-Fi, " + maxW + "p wide" : ""), slow ? "wait" : "live");
+        gotFirst = true; sent = 0; t0 = now;
+      }
     })
     .catch(() => { if (++failing > 3) status("Can't reach NexusCam", "err"); })
     .finally(() => { inflight--; });
@@ -866,9 +887,11 @@ function loop(){
   const w = v.videoWidth, h = v.videoHeight;
   turn.style.display = (w && h > w) ? "block" : "none";
   if (w && inflight < 2 && document.visibilityState === "visible") {
-    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
-    ctx.drawImage(v, 0, 0, w, h);
-    c.toBlob(b => b && send(b), "image/jpeg", 0.82);
+    const sc = Math.min(1, maxW / Math.max(w, h));
+    const cw = Math.round(w * sc), ch = Math.round(h * sc);
+    if (c.width !== cw || c.height !== ch) { c.width = cw; c.height = ch; }
+    ctx.drawImage(v, 0, 0, cw, ch);
+    c.toBlob(b => b && send(b), "image/jpeg", jq);
   }
   if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(loop); else setTimeout(loop, 33);
 }
@@ -888,7 +911,7 @@ async function start(){
     return;
   }
   fetch("/hello?k=" + K, {method:"POST", body: JSON.stringify({device: navigator.userAgentData?.platform || (navigator.userAgent.match(/\(([^;)]+)/)||[])[1] || "Phone"})}).catch(()=>{});
-  running = true; t0 = performance.now(); sent = 0;
+  running = true; t0 = performance.now(); sent = 0; gotFirst = false; rtt = 0; jq = 0.8; maxW = quality;
   go.disabled = false; go.textContent = "Stop"; go.className = "stop";
   status("Connecting…", "wait"); keepAwake(); loop();
 }
